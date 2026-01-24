@@ -1,3 +1,4 @@
+import certifi
 import discord
 import asyncio
 import traceback
@@ -9,6 +10,7 @@ from discord.ext import commands
 from riotwatcher import LolWatcher, RiotWatcher, ApiError
 from pymongo import MongoClient
 from keep_alive import keep_alive
+
 
 # ==========================================
 # 設定項目 & DB接続
@@ -62,9 +64,10 @@ users_col = None
 
 if MONGO_URL:
     try:
-        mongo_client = MongoClient(MONGO_URL)
-        db = mongo_client.lol_bot_db  # データベース名
-        users_col = db.users  # コレクション名（テーブルのようなもの）
+        # ★ tlsCAFile=certifi.where() を追加
+        mongo_client = MongoClient(MONGO_URL, tlsCAFile=certifi.where())
+        db = mongo_client.lol_bot_db
+        users_col = db.users
         print("✅ MongoDB接続成功")
     except Exception as e:
         print(f"❌ MongoDB接続エラー: {e}")
