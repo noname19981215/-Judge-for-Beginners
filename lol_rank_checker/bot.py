@@ -31,10 +31,9 @@ ROLE_ADVISOR = "助言者"
 
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
-MAX_LEVEL = 150
+MAX_LEVEL = 500
 
 # モード設定
-# ここでの設定値は「このティアの適正上限（これを超えると強すぎる）」を表します
 current_mode = "BEGINNER"
 THRESHOLDS = {
     "BEGINNER": {"name": "🔰 初心者帯 (Iron/Bronze)", "win_rate": 60, "kda": 4.0, "cspm": 7.0, "gpm": 450, "dmg": 30.0},
@@ -206,6 +205,10 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
 
         return {"status": "REVIEW", "reason": "完了", "data": data_snapshot}
 
+    except Exception as e:
+        print(traceback.format_exc())
+        return {"status": "ERROR", "reason": f"エラー: {e}"}
+
 
 # ==========================================
 # コマンド群
@@ -324,4 +327,221 @@ async def link(ctx, riot_id_str):
     if status == "GRADUATE":
         await ctx.send("🎓 レベル上限を超えているため、卒業対象となります。")
         try:
-            admin = await bot.fetch
+            admin = await bot.fetch_user(current_admin_id)
+            if admin:
+                d = result['data']
+                await admin.send(
+                    f"**【🎓 卒業推奨】**\n対象: {member.mention}\nID: `{d['riot_id']}`\nLv: **{d['level_raw']}** (上限:{MAX_LEVEL})\n`/graduate {member.id}`")
+        except:
+            pass
+        return
+
+    role_waiting = discord.utils.get(ctx.guild.roles, name=ROLE_WAITING)
+    if role_waiting: await member.add_roles(role_waiting)
+
+    await ctx.send("📋 集計完了。管理者の承認をお待ちください。")
+    try:
+        admin = await bot.fetch_user(current_admin_id)
+        if admin:
+            d = result['data']
+            opgg = f"https://www.op.gg/summoners/jp/{name}-{tag}"
+            cfg = THRESHOLDS[current_mode]
+
+            advisor_mark = "🔰(助言者/免除)" if is_exempt else f"{cfg['name']}"
+
+            msg = (
+                f"**【新規申請 / {advisor_mark}】**\n対象: {member.mention}\nID: `{d['riot_id']}`\n"
+                f"Lv:{d['fmt_level']} Win:{d['fmt_win']} KDA:{d['fmt_kda']}\n"
+                f"CS:{d['fmt_cspm']} GPM:{d['fmt_gpm']} Dmg:{d['fmt_dmg']}\n"
+                f"警告: {d['troll']}\n🔗 [OP.GG]({opgg})\n`/approve {member.id}` / `/reject {member.id}`"
+            )
+            await admin.send(msg)
+    except:
+        pass
+
+
+@bot.command()
+async def audit(ctx):
+    """🔍【管理者用】全員のレベル・ランクを一括検査します"""
+    if not is_admin_or_owner(ctx): return
+    if not users_col: return await ctx.send("❌ DB未接続")
+
+    msg = await ctx.send("🔍 全員分の最新データを取得中... (助言者はスキップします)")
+    users = list(users_col.find())
+    graduates = []
+
+    role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
+
+    for u in users:
+        member = ctx.guild.get_member(u['discord_id'])
+        if member and role_advisor and role_advisor in member.roles:
+            continue
+
+        await asyncio.sleep(1.2)
+        try:
+            summ = lol_watcher.summoner.by_puuid(REGION_PLATFORM, u['puuid'])
+            new_level = summ['summonerLevel']
+
+            if new_level != u['level']:
+                users_col.update_one({"_id": u['_id']}, {"$set": {"level": new_level}})
+
+            if new_level >= MAX_LEVEL:
+                graduates.append(f"<@{u['discord_id']}> (Lv.{new_level})")
+        except Exception as e:
+            print(f"Error checking {u['riot_name']}: {e}")
+            continue
+
+    if graduates:
+        await ctx.send(f"⚠️ **卒業対象者が見つかりました:**\n" + "\n".join(graduates))
+    else:
+        await ctx.send("✅ 全員レベル基準内です。")
+
+
+@bot.command()
+async def approve(ctx, user_id: int):
+    """✅【管理者用】申請を承認し、メンバーロールを付与します"""
+    if ctx.author.id != current_admin_id: return
+    member = ctx.guild.get_member(user_id)
+    if member:
+        role_mem = discord.utils.get(ctx.guild.roles, name=ROLE_MEMBER)
+        role_wait = discord.utils.get(ctx.guild.roles, name=ROLE_WAITING)
+        if role_wait in member.roles: await member.remove_roles(role_wait)
+        if role_mem: await member.add_roles(role_mem)
+        await ctx.send(f"✅ {member.display_name} を承認しました")
+
+
+@bot.command()
+async def reject(ctx, user_id: int):
+    """🚫【管理者用】申請を拒否し、サーバーからKickします"""
+    if ctx.author.id != current_admin_id: return
+    member = ctx.guild.get_member(user_id)
+    if member:
+        await ctx.guild.kick(member, reason="審査拒否")
+        await ctx.send(f"🚫 {member.display_name} を拒否しました")
+
+
+@bot.command()
+async def graduate(ctx, user_id: int):
+    """🎓【管理者用】[レベル上限] メンバーを卒業(Kick)させ、DMを送ります"""
+    if ctx.author.id != current_admin_id: return
+    member = ctx.guild.get_member(user_id)
+    if member:
+        try:
+            await member.send(
+                f"🌸 レベル上限({MAX_LEVEL})に達したため、サーバーを卒業となります。ご利用ありがとうございました！")
+        except:
+            pass
+        await ctx.guild.kick(member, reason="レベル卒業")
+        if users_col: users_col.delete_one({"discord_id": user_id})
+        await ctx.send(f"🎓 {member.display_name} を卒業(Kick)させました。")
+
+
+@bot.command()
+async def graduate_rank(ctx, user_id: int):
+    """🎉【管理者用】[ランク昇格] メンバーを卒業(Kick)させ、お祝いDMを送ります"""
+    if ctx.author.id != current_admin_id: return
+    member = ctx.guild.get_member(user_id)
+    if member:
+        try:
+            msg = (
+                f"🎉 **ランク昇格おめでとうございます！**\n\n"
+                f"シルバーランク（またはそれ以上）に到達されたため、初心者サーバーを『卒業』となります。\n"
+                f"このサーバーでの経験を活かし、今後のランク戦でもますますのご活躍をお祈り申し上げます！GG！"
+            )
+            await member.send(msg)
+        except:
+            pass
+        await ctx.guild.kick(member, reason="ランク昇格による卒業")
+        if users_col: users_col.delete_one({"discord_id": user_id})
+        await ctx.send(f"🎉 {member.display_name} をランク昇格により卒業(Kick)させました。")
+
+
+@bot.command()
+async def list(ctx):
+    """📋 登録済みメンバーのOP.GGリンク一覧を表示します"""
+    if not users_col: return await ctx.send("❌ DB未接続")
+    users = users_col.find()
+    msg = "**📋 メンバーリスト**\n"
+    count = 0
+    for u in users:
+        count += 1
+        name_safe = u['riot_name'].replace(" ", "%20")
+        url = f"https://www.op.gg/summoners/jp/{name_safe}-{u['riot_tag']}"
+        discord_user = ctx.guild.get_member(u['discord_id'])
+        d_name = discord_user.display_name if discord_user else "退室済み"
+        line = f"• **{d_name}**: [{u['riot_name']}#{u['riot_tag']}]({url}) (Lv.{u['level']})\n"
+        if len(msg + line) > 1900:
+            msg += "...(他省略)"
+            break
+        msg += line
+    if count == 0: msg += "登録なし"
+    await ctx.send(msg)
+
+
+@bot.command()
+async def export(ctx):
+    """📊【管理者用】メンバーリストをCSVファイル(Excel用)で出力します"""
+    if not is_admin_or_owner(ctx): return
+    if not users_col: return await ctx.send("❌ DB未接続")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Discord Name', 'Discord ID', 'Riot Name', 'Riot Tag', 'Level', 'OP.GG Link'])
+    for u in users_col.find():
+        name_safe = u['riot_name'].replace(" ", "%20")
+        url = f"https://www.op.gg/summoners/jp/{name_safe}-{u['riot_tag']}"
+        discord_user = ctx.guild.get_member(u['discord_id'])
+        d_name = discord_user.name if discord_user else "Unknown"
+        writer.writerow([d_name, u['discord_id'], u['riot_name'], u['riot_tag'], u['level'], url])
+    output.seek(0)
+    await ctx.send("📊 メンバーリストを出力しました。", file=discord.File(output, "members.csv"))
+
+
+@bot.command()
+async def set_mode(ctx, mode: str):
+    """⚙️【管理者用】判定基準を変更します (beginner/intermediate/advanced)"""
+    if not is_admin_or_owner(ctx): return
+    global current_mode
+    mode = mode.upper()
+    if mode in THRESHOLDS:
+        current_mode = mode
+        await ctx.send(f"✅ モード変更: {THRESHOLDS[mode]['name']}")
+
+
+@bot.group(invoke_without_command=True)
+async def settings(ctx):
+    """🛠️【管理者用】Botの設定確認・管理者の変更などを行います"""
+    if not is_admin_or_owner(ctx): return
+    admin_user = await bot.fetch_user(current_admin_id) if current_admin_id else None
+    admin_name = admin_user.name if admin_user else "未設定"
+    target_guild = bot.get_guild(current_guild_id)
+    guild_name = target_guild.name if target_guild else "未設定"
+    msg = (
+        f"⚙️ **Bot設定** ⚙️\n"
+        f"👤 管理者: `{admin_name}`\n"
+        f"🏠 サーバー: `{guild_name}`\n"
+        f"📊 モード: `{THRESHOLDS[current_mode]['name']}`\n"
+        f"🎓 卒業レベル: `{MAX_LEVEL}`\n"
+        f"🛡️ 免除ロール: `{ROLE_ADVISOR}`"
+    )
+    await ctx.send(msg)
+
+
+@settings.command()
+async def admin(ctx, user: discord.User):
+    if not is_admin_or_owner(ctx): return
+    global current_admin_id
+    current_admin_id = user.id
+    await ctx.send(f"✅ 管理者を変更: {user.mention}")
+
+
+@settings.command()
+async def server(ctx):
+    if not is_admin_or_owner(ctx): return
+    global current_guild_id
+    current_guild_id = ctx.guild.id
+    await ctx.send(f"✅ 対象サーバーを変更: {ctx.guild.name}")
+
+
+keep_alive()
+if DISCORD_TOKEN:
+    bot.run(DISCORD_TOKEN)
