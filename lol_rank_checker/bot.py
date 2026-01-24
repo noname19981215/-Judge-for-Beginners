@@ -31,7 +31,7 @@ ROLE_ADVISOR = "助言者"
 
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
-MAX_LEVEL = 500
+MAX_LEVEL = 150
 
 # モード設定
 current_mode = "BEGINNER"
@@ -218,10 +218,10 @@ async def on_ready():
     print(f'Bot is ready: {bot.user.name}')
 
 
-# --- ★ コマンド一覧表示コマンド (NEW) ---
+# --- ★ コマンド一覧表示コマンド ---
 @bot.command()
 async def manual(ctx):
-    """コマンド一覧を表示"""
+    """📘 コマンド一覧を見やすく表示します"""
     embed = discord.Embed(title="📜 Botコマンド一覧", description="利用可能なコマンドのマニュアルです。",
                           color=discord.Color.blue())
 
@@ -236,17 +236,18 @@ async def manual(ctx):
     )
     embed.add_field(name="🔰 一般・メンバー用", value=general_cmds, inline=False)
 
-    # 管理者用 (権限がある人だけに見えるようにする)
+    # 管理者用
     if is_admin_or_owner(ctx):
         admin_cmds = (
             "**--- 審査・人事 ---**\n"
             "`/approve [ID]` : 申請を承認してメンバー化\n"
             "`/reject [ID]` : 申請を拒否 (Kick)\n"
-            "`/graduate [ID]` : 卒業させる (Kick+DM)\n\n"
+            "`/graduate [ID]` : レベル上限による卒業 (Kick+DM)\n"
+            "`/graduate_rank [ID]` : ランク昇格による卒業 (Kick+祝いDM) ★New\n\n"
             "**--- 管理・分析 ---**\n"
             "`/audit` : 全員のレベルを一括再検査 (助言者はスルー)\n"
             "`/export` : 名簿をExcel用CSVで出力\n"
-            "`/set_mode [beginner/intermediate/advanced]` : 基準変更\n"
+            "`/set_mode [mode]` : 基準変更 (beginner/intermediate/advanced)\n"
             "`/settings` : Botの設定確認・管理者変更"
         )
         embed.add_field(name="👑 管理者用 (Admin Only)", value=admin_cmds, inline=False)
@@ -257,6 +258,7 @@ async def manual(ctx):
 # --- 通常コマンド ---
 @bot.command()
 async def link(ctx, riot_id_str):
+    """📝 Riotアカウントを紐付けて審査を申請します (例: /link Name#Tag)"""
     if '#' not in riot_id_str:
         await ctx.send("❌ `Name#Tag` で入力してください")
         return
@@ -319,6 +321,7 @@ async def link(ctx, riot_id_str):
 
 @bot.command()
 async def audit(ctx):
+    """🔍【管理者用】全員のレベル・ランクを一括検査します"""
     if not is_admin_or_owner(ctx): return
     if not users_col: return await ctx.send("❌ DB未接続")
 
@@ -355,6 +358,7 @@ async def audit(ctx):
 
 @bot.command()
 async def approve(ctx, user_id: int):
+    """✅【管理者用】申請を承認し、メンバーロールを付与します"""
     if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
@@ -367,6 +371,7 @@ async def approve(ctx, user_id: int):
 
 @bot.command()
 async def reject(ctx, user_id: int):
+    """🚫【管理者用】申請を拒否し、サーバーからKickします"""
     if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
@@ -376,6 +381,7 @@ async def reject(ctx, user_id: int):
 
 @bot.command()
 async def graduate(ctx, user_id: int):
+    """🎓【管理者用】[レベル上限] メンバーを卒業(Kick)させ、DMを送ります"""
     if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
@@ -384,13 +390,37 @@ async def graduate(ctx, user_id: int):
                 f"🌸 レベル上限({MAX_LEVEL})に達したため、サーバーを卒業となります。ご利用ありがとうございました！")
         except:
             pass
-        await ctx.guild.kick(member, reason="卒業")
+        await ctx.guild.kick(member, reason="レベル卒業")
         if users_col: users_col.delete_one({"discord_id": user_id})
         await ctx.send(f"🎓 {member.display_name} を卒業(Kick)させました。")
 
 
+# --- ★ 新コマンド: ランク卒業 ---
+@bot.command()
+async def graduate_rank(ctx, user_id: int):
+    """🎉【管理者用】[ランク昇格] メンバーを卒業(Kick)させ、お祝いDMを送ります"""
+    if ctx.author.id != current_admin_id: return
+    member = ctx.guild.get_member(user_id)
+    if member:
+        try:
+            # ランク用のお祝いメッセージ
+            msg = (
+                f"🎉 **ランク昇格おめでとうございます！**\n\n"
+                f"シルバーランク（またはそれ以上）に到達されたため、初心者サーバーを『卒業』となります。\n"
+                f"このサーバーでの経験を活かし、今後のランク戦でもますますのご活躍をお祈り申し上げます！GG！"
+            )
+            await member.send(msg)
+        except:
+            pass
+
+        await ctx.guild.kick(member, reason="ランク昇格による卒業")
+        if users_col: users_col.delete_one({"discord_id": user_id})
+        await ctx.send(f"🎉 {member.display_name} をランク昇格により卒業(Kick)させました。")
+
+
 @bot.command()
 async def list(ctx):
+    """📋 登録済みメンバーのOP.GGリンク一覧を表示します"""
     if not users_col: return await ctx.send("❌ DB未接続")
     users = users_col.find()
     msg = "**📋 メンバーリスト**\n"
@@ -412,6 +442,7 @@ async def list(ctx):
 
 @bot.command()
 async def export(ctx):
+    """📊【管理者用】メンバーリストをCSVファイル(Excel用)で出力します"""
     if not is_admin_or_owner(ctx): return
     if not users_col: return await ctx.send("❌ DB未接続")
     output = io.StringIO()
@@ -429,6 +460,7 @@ async def export(ctx):
 
 @bot.command()
 async def set_mode(ctx, mode: str):
+    """⚙️【管理者用】判定基準を変更します (beginner/intermediate/advanced)"""
     if not is_admin_or_owner(ctx): return
     global current_mode
     mode = mode.upper()
@@ -439,6 +471,7 @@ async def set_mode(ctx, mode: str):
 
 @bot.group(invoke_without_command=True)
 async def settings(ctx):
+    """🛠️【管理者用】Botの設定確認・管理者の変更などを行います"""
     if not is_admin_or_owner(ctx): return
     admin_user = await bot.fetch_user(current_admin_id) if current_admin_id else None
     admin_name = admin_user.name if admin_user else "未設定"
