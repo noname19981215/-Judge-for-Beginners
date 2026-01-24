@@ -2,265 +2,254 @@ import discord
 import asyncio
 import traceback
 import os
+import csv
+import io
+import datetime
 from discord.ext import commands
 from riotwatcher import LolWatcher, RiotWatcher, ApiError
+from pymongo import MongoClient
 from keep_alive import keep_alive
 
 # ==========================================
-# 設定項目
+# 設定項目 & DB接続
 # ==========================================
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 RIOT_API_KEY = os.getenv('RIOT_API_KEY')
-ADMIN_USER_ID = 269068756075020288  # 通知を送る管理者のDiscord User ID
-GUILD_ID = 1445037162968907890  # 対象のサーバーID
+MONGO_URL = os.getenv('MONGO_URL')  # ★追加: DB接続URL
+
+# 初期管理者設定
+ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
+GUILD_ID = int(os.getenv('GUILD_ID', 0))
+
+current_admin_id = ADMIN_USER_ID
+current_guild_id = GUILD_ID
 
 ROLE_MEMBER = "Member"
 ROLE_WAITING = "waiting_review"
-
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
+MAX_LEVEL = 200  # 卒業レベル
 
-# 基準値設定
+# モード設定
 current_mode = "BEGINNER"
 THRESHOLDS = {
-    "BEGINNER": {
-        "name": "🔰 初心者帯 (Iron/Bronze)",
-        "win_rate": 60, "kda": 4.0, "cspm": 7.0, "gpm": 450, "dmg": 30.0
-    },
-    "INTERMEDIATE": {
-        "name": "🛡️ 中級者帯 (Silver/Gold)",
-        "win_rate": 60, "kda": 4.5, "cspm": 7.5, "gpm": 500, "dmg": 32.0
-    },
-    "ADVANCED": {
-        "name": "⚔️ 上級者帯 (Plat+)",
-        "win_rate": 65, "kda": 5.0, "cspm": 8.5, "gpm": 550, "dmg": 35.0
-    }
+    "BEGINNER": {"name": "🔰 初心者帯 (Iron/Bronze)", "win_rate": 60, "kda": 4.0, "cspm": 7.0, "gpm": 450, "dmg": 30.0},
+    "INTERMEDIATE": {"name": "🛡️ 中級者帯 (Silver/Gold)", "win_rate": 60, "kda": 4.5, "cspm": 7.5, "gpm": 500,
+                     "dmg": 32.0},
+    "ADVANCED": {"name": "⚔️ 上級者帯 (Plat+)", "win_rate": 65, "kda": 5.0, "cspm": 8.5, "gpm": 550, "dmg": 35.0}
 }
 
+# ==========================================
+# 初期化
+# ==========================================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
+# Riot API
 if not RIOT_API_KEY:
-    print("⚠️ RIOT_API_KEY が設定されていません。")
     lol_watcher = LolWatcher('dummy')
     riot_watcher = RiotWatcher('dummy')
 else:
     lol_watcher = LolWatcher(RIOT_API_KEY)
     riot_watcher = RiotWatcher(RIOT_API_KEY)
 
+# MongoDB接続
+mongo_client = None
+db = None
+users_col = None
+
+if MONGO_URL:
+    try:
+        mongo_client = MongoClient(MONGO_URL)
+        db = mongo_client.lol_bot_db  # データベース名
+        users_col = db.users  # コレクション名（テーブルのようなもの）
+        print("✅ MongoDB接続成功")
+    except Exception as e:
+        print(f"❌ MongoDB接続エラー: {e}")
+else:
+    print("⚠️ MONGO_URL が設定されていません。DB機能は使えません。")
+
 
 # ==========================================
-# 戦績分析ロジック (トロール検知追加版)
+# 補助関数
 # ==========================================
-async def analyze_player_stats(riot_id_name, riot_id_tag):
+def is_admin_or_owner(ctx):
+    return ctx.author.id == current_admin_id or ctx.author.id == ctx.guild.owner_id
+
+
+# データをDBに保存/更新する関数
+def save_user_to_db(discord_id, riot_name, riot_tag, puuid, level):
+    if users_col is None: return
+    now = datetime.datetime.now()
+    user_data = {
+        "discord_id": discord_id,
+        "riot_name": riot_name,
+        "riot_tag": riot_tag,
+        "puuid": puuid,
+        "level": level,
+        "last_updated": now
+    }
+    # Discord IDをキーにして上書き保存（Upsert）
+    users_col.update_one({"discord_id": discord_id}, {"$set": user_data}, upsert=True)
+    print(f"💾 DB保存完了: {riot_name}#{riot_tag}")
+
+
+# ==========================================
+# 分析ロジック (分析 + DB保存対応)
+# ==========================================
+async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=None):
     config = THRESHOLDS[current_mode]
     try:
-        print(f"--- 集計開始: {riot_id_name}#{riot_id_tag} ---")
-
+        # PUUID取得
         account = riot_watcher.account.by_riot_id(REGION_ACCOUNT, riot_id_name, riot_id_tag)
         puuid = account.get('puuid')
         if not puuid: return {"status": "ERROR", "reason": "PUUID取得不可", "data": locals()}
 
+        # レベル取得 & 卒業チェック
         summoner = lol_watcher.summoner.by_puuid(REGION_PLATFORM, puuid)
         acct_level = summoner.get('summonerLevel', 0)
 
-        matches = lol_watcher.match.matchlist_by_puuid(REGION_ACCOUNT, puuid, count=20)
-        match_count = len(matches)
+        # ★ ここでDB保存（Discord IDが渡されていれば）
+        # まだ審査前ですが、情報は正しいので「申請中データ」として更新しておきます
+        if discord_id_for_save:
+            save_user_to_db(discord_id_for_save, riot_id_name, riot_id_tag, puuid, acct_level)
 
-        if match_count == 0:
+        if acct_level >= MAX_LEVEL:
+            return {"status": "GRADUATE", "reason": f"レベル上限超過 (Lv{acct_level})",
+                    "data": {"riot_id": f"{riot_id_name}#{riot_id_tag}", "level_raw": acct_level}}
+
+        # 試合履歴取得
+        matches = lol_watcher.match.matchlist_by_puuid(REGION_ACCOUNT, puuid, count=20)
+        if not matches:
             return {"status": "REVIEW", "reason": "試合データなし", "data": locals()}
 
-        # 集計用変数
-        wins = 0
-        recent_10_wins = 0
-        total_kills = 0;
-        total_deaths = 0;
-        total_assists = 0
-        total_cspm = 0;
-        total_gpm = 0;
-        total_dmg_share = 0
-        valid_game_count = 0
+        # 集計処理
+        wins = 0;
+        valid = 0
+        kills = 0;
+        deaths = 0;
+        assists = 0
+        cspm = 0;
+        gpm = 0;
+        dmg_share = 0
 
-        # ★トロール検知用カウンタ
-        high_death_games = 0  # 12デス以上の試合数
-        no_item_games = 0  # アイテム放棄試合数
-        low_dmg_games = 0  # ダメージ放棄試合数(5%未満)
-        ff_games = 0  # 20分未満での敗北(早期サレンダー)
+        # トロール検知用
+        troll_deaths = 0;
+        troll_items = 0;
+        troll_dmg = 0;
+        troll_ff = 0
 
-        for idx, match_id in enumerate(matches):
+        for match_id in matches:
             await asyncio.sleep(0.5)
             try:
-                match_detail = lol_watcher.match.by_id(REGION_ACCOUNT, match_id)
+                match = lol_watcher.match.by_id(REGION_ACCOUNT, match_id)
             except:
                 continue
 
-            game_duration = match_detail['info']['gameDuration']
-            if game_duration < 300: continue  # Remake除外
+            info = match['info']
+            if info['gameDuration'] < 300: continue
 
-            game_duration_min = game_duration / 60
-            valid_game_count += 1
-            participants = match_detail['info']['participants']
+            valid += 1
+            duration_min = info['gameDuration'] / 60
 
-            # 自分のデータ取得
-            my_part = None
-            team_total_dmg = 0
-            my_team_id = 0
+            # 自分を探す
+            me = next((p for p in info['participants'] if p['puuid'] == puuid), None)
+            if not me: continue
 
-            for p in participants:
-                if p['puuid'] == puuid:
-                    my_part = p
-                    my_team_id = p['teamId']
+            # 味方チーム総ダメージ
+            team_dmg = sum(
+                p['totalDamageDealtToChampions'] for p in info['participants'] if p['teamId'] == me['teamId'])
 
-            # 味方総ダメージ計算 (後で使う)
-            for p in participants:
-                if p['teamId'] == my_team_id:
-                    team_total_dmg += p['totalDamageDealtToChampions']
+            if me['win']:
+                wins += 1
+            elif info['gameDuration'] < 1200:
+                troll_ff += 1
 
-            if my_part:
-                # 1. 基本スタッツ
-                if my_part['win']:
-                    wins += 1
-                    if idx < 10: recent_10_wins += 1
-                else:
-                    # 敗北時に時間が短い = FFの可能性大 (15分〜20分)
-                    if game_duration < 1200:
-                        ff_games += 1
+            kills += me['kills']
+            deaths += me['deaths']
+            assists += me['assists']
 
-                total_kills += my_part['kills']
-                total_deaths += my_part['deaths']
-                total_assists += my_part['assists']
+            cs = me['totalMinionsKilled'] + me['neutralMinionsKilled']
+            cspm += cs / duration_min
+            gpm += me['goldEarned'] / duration_min
 
-                cs = my_part['totalMinionsKilled'] + my_part['neutralMinionsKilled']
-                total_cspm += (cs / game_duration_min)
-                total_gpm += (my_part['goldEarned'] / game_duration_min)
+            if team_total_dmg := team_dmg:
+                dmg_share += (me['totalDamageDealtToChampions'] / team_total_dmg) * 100
 
-                # 2. ダメージ比率
-                my_dmg = my_part['totalDamageDealtToChampions']
-                dmg_share = 0
-                if team_total_dmg > 0:
-                    dmg_share = (my_dmg / team_total_dmg) * 100
-                    total_dmg_share += dmg_share
+            # トロール判定
+            if me['deaths'] >= 12: troll_deaths += 1
 
-                # --- ★トロール判定カウント ---
+            item_cnt = sum(1 for i in range(6) if me.get(f'item{i}', 0) != 0)
+            if item_cnt <= 1 and duration_min > 10: troll_items += 1
+            if team_total_dmg > 0 and (me['totalDamageDealtToChampions'] / team_total_dmg) * 100 < 5.0: troll_dmg += 1
 
-                # A. 過度なデス (Feed)
-                if my_part['deaths'] >= 12:
-                    high_death_games += 1
+        if valid == 0: return {"status": "REVIEW", "reason": "有効データなし", "data": locals()}
 
-                # B. アイテム売却 (トロールビルド)
-                # アイテムスロット(item0~5)が空っぽかどうか
-                item_count = 0
-                for i in range(6):
-                    if my_part.get(f'item{i}', 0) != 0:
-                        item_count += 1
-                if item_count <= 1 and game_duration > 600:  # 10分以上でアイテム1個以下
-                    no_item_games += 1
+        # 平均・整形
+        win_rate = (wins / valid) * 100
+        avg_kda = (kills + assists) / (deaths if deaths > 0 else 1)
+        avg_cspm = cspm / valid
+        avg_gpm = gpm / valid
+        avg_dmg = dmg_share / valid
 
-                # C. ダメージ放棄 (Sup以外で極端に低い)
-                # (ロール判定は難しいので一律判定だが、Supでも5%は超えるはず)
-                if dmg_share < 5.0:
-                    low_dmg_games += 1
+        # 文字列整形関数
+        def fmt(val, thresh, unit="", low_bad=False):
+            s = f"{round(val, 1)}"
+            is_bad = val < thresh if low_bad else val >= thresh
+            return f"⚠️ **{s}{unit}**" if is_bad else f"{s}{unit}"
 
-        if valid_game_count == 0:
-            return {"status": "REVIEW", "reason": "有効な試合データなし", "data": locals()}
-
-        # 平均計算
-        win_rate = (wins / valid_game_count) * 100
-        avg_deaths = total_deaths if total_deaths > 0 else 1
-        kda = (total_kills + total_assists) / avg_deaths
-        avg_cspm = total_cspm / valid_game_count
-        avg_gpm = total_gpm / valid_game_count
-        avg_dmg_share = total_dmg_share / valid_game_count
+        trolls = []
+        if troll_deaths >= valid * 0.3: trolls.append(f"💀OverDeath({troll_deaths})")
+        if troll_items >= 1: trolls.append(f"💀NoItem")
+        if troll_dmg >= 2: trolls.append(f"💀LowDmg")
+        if (valid - wins) > 0 and (troll_ff / (valid - wins)) >= 0.5: trolls.append(f"💀EarlyFF")
 
         data_snapshot = {
             "riot_id": f"{riot_id_name}#{riot_id_tag}",
-            "level": acct_level,
-            "win_rate": round(win_rate, 1),
-            "kda": round(kda, 2),
-            "cspm": round(avg_cspm, 1),
-            "gpm": round(avg_gpm, 0),
-            "dmg_share": round(avg_dmg_share, 1),
-            "matches": valid_game_count,
+            "level_raw": acct_level,
+            "fmt_level": fmt(acct_level, 50, "", True),
+            "fmt_win": fmt(win_rate, config["win_rate"], "%"),
+            "fmt_kda": fmt(avg_kda, config["kda"]),
+            "fmt_cspm": fmt(avg_cspm, config["cspm"]),
+            "fmt_gpm": fmt(avg_gpm, config["gpm"]),
+            "fmt_dmg": fmt(avg_dmg, config["dmg"], "%"),
+            "troll": " / ".join(trolls) if trolls else "なし",
+            "matches": valid
         }
 
-        # --- 判定ロジック ---
-        reasons = []
-
-        # 1. スマーフ・代行判定 (既存)
-        if win_rate >= config["win_rate"]: reasons.append(f"⚠️高勝率({round(win_rate)}%)")
-        if kda >= config["kda"]: reasons.append(f"⚠️高KDA({round(kda, 2)})")
-        if avg_cspm >= config["cspm"]: reasons.append(f"⚠️高CS({round(avg_cspm, 1)}/分)")
-        if avg_dmg_share >= config["dmg"]: reasons.append(f"⚠️高ダメ比率({round(avg_dmg_share)}%)")
-        if avg_gpm >= config["gpm"]: reasons.append(f"⚠️金持ち({round(avg_gpm)}G/分)")
-        if acct_level < 50: reasons.append(f"⚠️低Lv(Lv{acct_level})")
-        if recent_10_wins >= 8: reasons.append("⚠️直近8勝以上")
-
-        # 2. ★トロール・トキシック判定 (新規追加)
-
-        # デス過多: 全試合の30%以上で12デッド以上している
-        if high_death_games >= (valid_game_count * 0.3):
-            reasons.append(f"💀フィード気味({high_death_games}試合で12Death超)")
-
-        # アイテム放棄
-        if no_item_games >= 1:
-            reasons.append(f"💀アイテム放棄検出({no_item_games}試合)")
-
-        # ダメージなし (AFK疑惑)
-        if low_dmg_games >= 2:
-            reasons.append(f"💀寄生・AFK疑惑({low_dmg_games}試合でDmg5%未満)")
-
-        # 早期サレンダー率が高い (メンタル弱い)
-        # 敗北試合の50%以上が早期サレンダー
-        losses = valid_game_count - wins
-        if losses > 0 and (ff_games / losses) >= 0.5:
-            reasons.append(f"💀早期FF多め({ff_games}回)")
-
-        if not reasons:
-            reasons.append("基準内")
-
-        return {"status": "REVIEW", "reason": ", ".join(reasons), "data": data_snapshot}
+        return {"status": "REVIEW", "reason": "完了", "data": data_snapshot}
 
     except Exception as e:
         print(traceback.format_exc())
-        return {"status": "ERROR", "reason": f"システムエラー: {e}"}
+        return {"status": "ERROR", "reason": f"エラー: {e}"}
 
 
 # ==========================================
-# Discord コマンド
+# コマンド
 # ==========================================
 @bot.event
 async def on_ready():
     print(f'Bot is ready: {bot.user.name}')
 
 
-@bot.command()
-async def set_mode(ctx, mode_name: str = None):
-    if ctx.author.id != ADMIN_USER_ID: return
-    global current_mode
-    if mode_name is None:
-        msg = f"📊 **現在の設定:** `{THRESHOLDS[current_mode]['name']}`\n`/set_mode beginner/intermediate/advanced`"
-        await ctx.send(msg)
-        return
-    key = mode_name.upper()
-    if key in THRESHOLDS:
-        current_mode = key
-        await ctx.send(f"✅ 設定変更: `{THRESHOLDS[key]['name']}`")
-    else:
-        await ctx.send("❌ 無効なモードです")
-
+# --- 通常コマンド ---
 
 @bot.command()
 async def link(ctx, riot_id_str):
     if '#' not in riot_id_str:
-        await ctx.send("❌ 形式エラー: `Name#Tag`")
+        await ctx.send("❌ `Name#Tag` で入力してください")
+        return
+    if current_guild_id != 0 and ctx.guild.id != current_guild_id:
+        await ctx.send("⚠️ 対象外サーバーです")
         return
 
     name, tag = riot_id_str.split('#', 1)
-    await ctx.send(f"📊 `{name}#{tag}` を分析中... (モード: {current_mode})")
+    await ctx.send(f"📊 `{name}#{tag}` を分析・登録中...")
 
-    result = await analyze_player_stats(name, tag)
+    # ★ 引数にDiscord IDを渡して、審査と同時に保存する
+    result = await analyze_player_stats(name, tag, ctx.author.id)
     status = result['status']
 
     if status == "ERROR":
@@ -268,41 +257,45 @@ async def link(ctx, riot_id_str):
         return
 
     member = ctx.author
-    role_waiting = discord.utils.get(ctx.guild.roles, name=ROLE_WAITING)
 
-    if status == "REVIEW":
-        if role_waiting: await member.add_roles(role_waiting)
-        await ctx.send("📋 集計完了。管理者通知を確認してください。")
-
+    # 卒業判定
+    if status == "GRADUATE":
+        await ctx.send("🎓 レベル上限を超えているため、卒業対象となります。")
         try:
-            admin_user = await bot.fetch_user(ADMIN_USER_ID)
-            if admin_user:
+            admin = await bot.fetch_user(current_admin_id)
+            if admin:
                 d = result['data']
-                opgg_link = f"https://www.op.gg/summoners/jp/{name}-{tag}"
-
-                # 理由に💀が含まれていたらトロール警告を見出しにする
-                alert_emoji = "🚨" if "💀" in result['reason'] else "⚠️"
-
-                msg = (
-                    f"**【{alert_emoji} 新規申請 / {THRESHOLDS[current_mode]['name']}】**\n"
-                    f"対象: {member.mention}\n"
-                    f"ID: `{d['riot_id']}`\n"
-                    f"Lv: {d['level']}\n"
-                    f"勝率: **{d['win_rate']}%**\n"
-                    f"KDA: **{d['kda']}**\n"
-                    f"CS/分: **{d['cspm']}**\n"
-                    f"判定: {result['reason']}\n\n"
-                    f"🔗 [OP.GG]({opgg_link})\n\n"
-                    f"`/approve {member.id}` / `/reject {member.id}`"
-                )
-                await admin_user.send(msg)
+                await admin.send(
+                    f"**【🎓 卒業推奨】**\n対象: {member.mention}\nID: `{d['riot_id']}`\nLv: **{d['level_raw']}** (上限:{MAX_LEVEL})\n`/graduate {member.id}`")
         except:
             pass
+        return
+
+    # 通常審査
+    role_waiting = discord.utils.get(ctx.guild.roles, name=ROLE_WAITING)
+    if role_waiting: await member.add_roles(role_waiting)
+
+    await ctx.send("📋 集計完了。管理者の承認をお待ちください。")
+    try:
+        admin = await bot.fetch_user(current_admin_id)
+        if admin:
+            d = result['data']
+            opgg = f"https://www.op.gg/summoners/jp/{name}-{tag}"
+            cfg = THRESHOLDS[current_mode]
+            msg = (
+                f"**【新規申請 / {cfg['name']}】**\n対象: {member.mention}\nID: `{d['riot_id']}`\n"
+                f"Lv:{d['fmt_level']} Win:{d['fmt_win']} KDA:{d['fmt_kda']}\n"
+                f"CS:{d['fmt_cspm']} GPM:{d['fmt_gpm']} Dmg:{d['fmt_dmg']}\n"
+                f"警告: {d['troll']}\n🔗 [OP.GG]({opgg})\n`/approve {member.id}` / `/reject {member.id}`"
+            )
+            await admin.send(msg)
+    except:
+        pass
 
 
 @bot.command()
 async def approve(ctx, user_id: int):
-    if ctx.author.id != ADMIN_USER_ID: return
+    if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
         role_mem = discord.utils.get(ctx.guild.roles, name=ROLE_MEMBER)
@@ -314,11 +307,126 @@ async def approve(ctx, user_id: int):
 
 @bot.command()
 async def reject(ctx, user_id: int):
-    if ctx.author.id != ADMIN_USER_ID: return
+    if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
         await ctx.guild.kick(member, reason="審査拒否")
         await ctx.send(f"🚫 {member.display_name} を拒否しました")
+
+
+@bot.command()
+async def graduate(ctx, user_id: int):
+    if ctx.author.id != current_admin_id: return
+    member = ctx.guild.get_member(user_id)
+    if member:
+        try:
+            await member.send(
+                f"🌸 レベル上限({MAX_LEVEL})に達したため、サーバーを卒業となります。ご利用ありがとうございました！")
+        except:
+            pass
+        await ctx.guild.kick(member, reason="卒業")
+
+        # DBからも削除する場合はこちら
+        if users_col: users_col.delete_one({"discord_id": user_id})
+        await ctx.send(f"🎓 {member.display_name} を卒業(Kick)させました。")
+
+
+# --- ★ DB活用コマンド (New!) ---
+
+@bot.command()
+async def list(ctx):
+    """登録メンバーのOP.GGリンク集を表示"""
+    if not users_col: return await ctx.send("❌ DB未接続")
+
+    users = users_col.find()
+    msg = "**📋 メンバーリスト**\n"
+    count = 0
+
+    for u in users:
+        count += 1
+        name_safe = u['riot_name'].replace(" ", "%20")
+        url = f"https://www.op.gg/summoners/jp/{name_safe}-{u['riot_tag']}"
+        discord_user = ctx.guild.get_member(u['discord_id'])
+        d_name = discord_user.display_name if discord_user else "退室済み"
+
+        line = f"• **{d_name}**: [{u['riot_name']}#{u['riot_tag']}]({url}) (Lv.{u['level']})\n"
+
+        # 文字数制限対策 (2000文字超えたら分割が必要だが簡易実装)
+        if len(msg + line) > 1900:
+            msg += "...(他省略)"
+            break
+        msg += line
+
+    if count == 0: msg += "登録なし"
+    await ctx.send(msg)
+
+
+@bot.command()
+async def export(ctx):
+    """メンバーリストをCSV(エクセル用)で出力"""
+    if not is_admin_or_owner(ctx): return
+    if not users_col: return await ctx.send("❌ DB未接続")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Discord Name', 'Discord ID', 'Riot Name', 'Riot Tag', 'Level', 'OP.GG Link'])
+
+    for u in users_col.find():
+        name_safe = u['riot_name'].replace(" ", "%20")
+        url = f"https://www.op.gg/summoners/jp/{name_safe}-{u['riot_tag']}"
+        discord_user = ctx.guild.get_member(u['discord_id'])
+        d_name = discord_user.name if discord_user else "Unknown"
+
+        writer.writerow([d_name, u['discord_id'], u['riot_name'], u['riot_tag'], u['level'], url])
+
+    output.seek(0)
+    await ctx.send("📊 メンバーリストを出力しました。", file=discord.File(output, "members.csv"))
+
+
+@bot.command()
+async def audit(ctx):
+    """【管理者用】全メンバーのレベルを一括再検査"""
+    if not is_admin_or_owner(ctx): return
+    if not users_col: return await ctx.send("❌ DB未接続")
+
+    msg = await ctx.send("🔍 全員分の最新データを取得中... (時間がかかります)")
+    users = list(users_col.find())  # 一旦リスト化
+
+    graduates = []
+
+    for u in users:
+        await asyncio.sleep(1.2)  # API制限回避(秒間20回制限対策)
+        try:
+            summ = lol_watcher.summoner.by_puuid(REGION_PLATFORM, u['puuid'])
+            new_level = summ['summonerLevel']
+
+            # レベル更新があればDBも更新
+            if new_level != u['level']:
+                users_col.update_one({"_id": u['_id']}, {"$set": {"level": new_level}})
+
+            # 卒業判定
+            if new_level >= MAX_LEVEL:
+                graduates.append(f"<@{u['discord_id']}> (Lv.{new_level})")
+
+        except Exception as e:
+            print(f"Error checking {u['riot_name']}: {e}")
+            continue
+
+    if graduates:
+        await ctx.send(f"⚠️ **卒業対象者が見つかりました:**\n" + "\n".join(graduates))
+    else:
+        await ctx.send("✅ 全員レベル基準内です。")
+
+
+# 設定変更コマンド
+@bot.command()
+async def set_mode(ctx, mode: str):
+    if not is_admin_or_owner(ctx): return
+    global current_mode
+    mode = mode.upper()
+    if mode in THRESHOLDS:
+        current_mode = mode
+        await ctx.send(f"✅ モード変更: {THRESHOLDS[mode]['name']}")
 
 
 keep_alive()
