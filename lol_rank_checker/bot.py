@@ -36,7 +36,7 @@ ROLE_ADVISOR = "助言者"
 
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
-MAX_LEVEL = 500
+MAX_LEVEL = 150
 
 # モード設定
 current_mode = "BEGINNER"
