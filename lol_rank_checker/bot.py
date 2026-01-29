@@ -33,6 +33,7 @@ current_guild_id = GUILD_ID
 ROLE_MEMBER = "Member"
 ROLE_WAITING = "waiting_review"
 ROLE_ADVISOR = "助言者"
+ROLE_GRACE = "卒業猶予"  # ★追加: レベル上限を無視できるロール
 
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
@@ -48,17 +49,14 @@ THRESHOLDS = {
 }
 
 # ==========================================
-# 初期化 (Discord & Riot API)
+# 初期化
 # ==========================================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-# Riot APIのタイムアウト設定 (5秒で諦めてフリーズ防止)
-api_config = {
-    "timeout": 5.0
-}
+api_config = {"timeout": 5.0}
 
 if not RIOT_API_KEY:
     lol_watcher = LolWatcher('dummy', **api_config)
@@ -68,39 +66,32 @@ else:
     riot_watcher = RiotWatcher(RIOT_API_KEY, timeout=5.0)
 
 # ==========================================
-# MongoDB接続 (★リトライ機能付き最強版)
+# MongoDB接続 (リトライ機能付き)
 # ==========================================
 mongo_client = None
 db = None
 users_col = None
 
 if MONGO_URL:
-    # 最大3回まで接続を試みるループ
     for attempt in range(1, 4):
         try:
             print(f"🔌 MongoDBに接続中... ({attempt}回目)")
-
-            # タイムアウトを30秒に延ばして、遅い回線でも待てるようにする
             mongo_client = MongoClient(
                 MONGO_URL,
                 tlsCAFile=certifi.where(),
-                serverSelectionTimeoutMS=30000,  # サーバーを見つけるまで30秒待つ
-                connectTimeoutMS=30000,  # 接続確立まで30秒待つ
-                socketTimeoutMS=None  # 接続後は切らない
+                serverSelectionTimeoutMS=30000,
+                connectTimeoutMS=30000,
+                socketTimeoutMS=None
             )
-
-            # 実際に通信して確認する（これが通れば成功）
             mongo_client.server_info()
-
             db = mongo_client.lol_bot_db
             users_col = db.users
             print("✅ MongoDB接続成功！")
-            break  # 成功したらループを抜ける
-
+            break
         except Exception as e:
             print(f"⚠️ 接続失敗 ({attempt}/3): {e}")
             if attempt < 3:
-                time.sleep(5)  # 5秒休んでから再挑戦
+                time.sleep(5)
             else:
                 print("❌ MongoDBへの接続を諦めました。DB機能なしで起動します。")
 
@@ -126,12 +117,10 @@ def save_user_to_db(discord_id, riot_name, riot_tag, puuid, level, stats=None):
             "last_updated": now
         }
         if stats: update_data.update(stats)
-
-        # 保存時は3秒でタイムアウトさせる（Bot全体を止めないため）
         users_col.with_options(timeout=3).update_one({"discord_id": discord_id}, {"$set": update_data}, upsert=True)
         print(f"💾 DB保存完了: {riot_name}#{riot_tag}")
     except Exception as e:
-        print(f"⚠️ DB保存スキップ(フリーズ回避): {e}")
+        print(f"⚠️ DB保存スキップ: {e}")
 
 
 # ==========================================
@@ -140,7 +129,13 @@ def save_user_to_db(discord_id, riot_name, riot_tag, puuid, level, stats=None):
 async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=None, is_exempt=False):
     config = THRESHOLDS[current_mode]
     try:
-        account = riot_watcher.account.by_riot_id(REGION_ACCOUNT, riot_id_name, riot_id_tag)
+        try:
+            account = riot_watcher.account.by_riot_id(REGION_ACCOUNT, riot_id_name, riot_id_tag)
+        except ApiError as err:
+            if err.response.status_code == 404:
+                return {"status": "ERROR", "reason": "プレイヤーが見つかりません (ID間違い または OP.GGが存在しません)"}
+            raise
+
         puuid = account.get('puuid')
         if not puuid: return {"status": "ERROR", "reason": "PUUID取得不可", "data": locals()}
 
@@ -150,6 +145,7 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
         if discord_id_for_save:
             save_user_to_db(discord_id_for_save, riot_id_name, riot_id_tag, puuid, acct_level)
 
+        # ★修正: 助言者または卒業猶予ロールがあればレベルチェックをスキップ
         if not is_exempt and acct_level >= MAX_LEVEL:
             return {"status": "GRADUATE", "reason": f"レベル上限超過 (Lv{acct_level})",
                     "data": {"riot_id": f"{riot_id_name}#{riot_id_tag}", "level_raw": acct_level}}
@@ -225,8 +221,10 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
 
         def fmt(val, thresh, unit="", low_bad=False):
             s = f"{round(val, 1)}"
+            t = f"{thresh}"
             is_bad = val < thresh if low_bad else val >= thresh
-            return f"⚠️ **{s}{unit}**" if is_bad else f"{s}{unit}"
+            display_str = f"{s}/{t}{unit}"
+            return f"⚠️ **{display_str}**" if is_bad else display_str
 
         trolls = []
         if troll_deaths >= valid * 0.3: trolls.append(f"💀OverDeath({troll_deaths})")
@@ -335,17 +333,20 @@ async def run_audit_logic(ctx):
     graduates = []
 
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
+    role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)  # ★追加
 
     for i, u in enumerate(users):
         member = ctx.guild.get_member(u['discord_id'])
-        if member and role_advisor and role_advisor in member.roles: continue
 
-        # ★修正: 監査の間隔を3秒に広げてAPIエラー防止
+        # ★修正: 助言者 または 卒業猶予ロールを持っているなら監査をスキップ
+        if member:
+            if role_advisor and role_advisor in member.roles: continue
+            if role_grace and role_grace in member.roles: continue
+
         await asyncio.sleep(3.0)
         try:
             summ = lol_watcher.summoner.by_puuid(REGION_PLATFORM, u['puuid'])
             new_level = summ['summonerLevel']
-            # DB書き込みもタイムアウト付きで安全に
             users_col.with_options(timeout=3).update_one({"_id": u['_id']}, {"$set": {"level": new_level}})
             if new_level >= MAX_LEVEL:
                 graduates.append(f"<@{u['discord_id']}> (Lv.{new_level})")
@@ -364,7 +365,6 @@ async def run_audit_logic(ctx):
 @bot.event
 async def on_ready():
     print(f'Bot is ready: {bot.user.name}')
-    # 起動通知
     if LOG_CHANNEL_ID:
         try:
             channel = bot.get_channel(LOG_CHANNEL_ID)
@@ -376,27 +376,35 @@ async def on_ready():
 
 @bot.command()
 async def dashboard(ctx):
-    """🎛️ 管理ダッシュボードを表示"""
     if not is_admin_or_owner(ctx): return
     await update_dashboard(ctx, ctx)
 
 
 @bot.command()
 async def link(ctx, riot_id_str):
-    """📝 審査申請 (例: /link Name#Tag)"""
     if '#' not in riot_id_str: return await ctx.send("❌ `Name#Tag`")
     if current_guild_id != 0 and ctx.guild.id != current_guild_id: return await ctx.send("⚠️ 対象外サーバー")
 
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
-    is_exempt = (role_advisor and role_advisor in ctx.author.roles)
+    role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)  # ★追加
+
+    # ★修正: 助言者または卒業猶予なら免除
+    is_exempt = False
+    if role_advisor and role_advisor in ctx.author.roles: is_exempt = True
+    if role_grace and role_grace in ctx.author.roles: is_exempt = True
 
     name, tag = riot_id_str.split('#', 1)
-    await ctx.send(f"📊 `{name}#{tag}` を分析中... {'(助言者)' if is_exempt else ''}")
+    # 免除フラグがある場合、メッセージに表示
+    note = ""
+    if is_exempt: note = "(免除対象)"
+
+    await ctx.send(f"📊 `{name}#{tag}` を分析中... {note}")
 
     result = await analyze_player_stats(name, tag, ctx.author.id, is_exempt=is_exempt)
     status = result['status']
 
     if status == "ERROR": return await ctx.send(f"❌ エラー: {result['reason']}")
+
     member = ctx.author
 
     if status == "GRADUATE":
@@ -420,9 +428,16 @@ async def link(ctx, riot_id_str):
         if admin:
             d = result['data']
             opgg = f"https://www.op.gg/summoners/jp/{name}-{tag}"
-            msg = (
-                f"**【新規申請】**\n対象: {member.mention}\nLv:{d['fmt_level']} Win:{d['fmt_win']} KDA:{d['fmt_kda']}\n"
-                f"警告: {d['troll']}\n🔗 [OP.GG]({opgg})\n`/approve {member.id}`")
+            mode_name = THRESHOLDS[current_mode]['name']
+
+            msg = (f"**【新規申請 / {mode_name}】**\n"
+                   f"対象: {member.mention}\n"
+                   f"ID: `{d['riot_id']}`\n"
+                   f"Lv: {d['fmt_level']} Win:{d['fmt_win']} KDA:{d['fmt_kda']}\n"
+                   f"CS:{d['fmt_cspm']} GPM: {d['fmt_gpm']} Dmg:{d['fmt_dmg']}\n"
+                   f"警告: {d['troll']} [OP.GG]({opgg})\n"
+                   f"`/approve {member.id}` / `/reject {member.id}`")
+
             await admin.send(msg)
     except:
         pass
@@ -430,7 +445,6 @@ async def link(ctx, riot_id_str):
 
 @bot.command()
 async def approve(ctx, user_id: int):
-    """✅ 承認"""
     if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
@@ -443,7 +457,6 @@ async def approve(ctx, user_id: int):
 
 @bot.command()
 async def reject(ctx, user_id: int):
-    """🚫 拒否"""
     if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
@@ -453,7 +466,6 @@ async def reject(ctx, user_id: int):
 
 @bot.command()
 async def graduate(ctx, user_id: int):
-    """🎓 レベル卒業"""
     if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
@@ -468,7 +480,6 @@ async def graduate(ctx, user_id: int):
 
 @bot.command()
 async def graduate_rank(ctx, user_id: int):
-    """🎉 ランク卒業"""
     if ctx.author.id != current_admin_id: return
     member = ctx.guild.get_member(user_id)
     if member:
@@ -483,9 +494,7 @@ async def graduate_rank(ctx, user_id: int):
 
 @bot.command()
 async def shutdown(ctx):
-    """🛑 Bot停止"""
     if not is_admin_or_owner(ctx): return
-    # 終了時にログ送信
     if LOG_CHANNEL_ID:
         try:
             channel = bot.get_channel(LOG_CHANNEL_ID)
@@ -498,7 +507,6 @@ async def shutdown(ctx):
 
 @bot.command()
 async def list(ctx):
-    """📋 メンバーリスト"""
     if not users_col: return await ctx.send("❌ DB未接続")
     users = users_col.find()
     msg = "**📋 メンバー**\n"
@@ -513,7 +521,6 @@ async def list(ctx):
 
 @bot.command()
 async def leaderboard(ctx, category: str = "level"):
-    """🏆 ランキング (level/win/kda)"""
     if not users_col: return await ctx.send("❌ DB未接続")
     settings = {"level": "レベル", "win": "勝率", "kda": "KDA"}
     cat = category.lower()
@@ -534,7 +541,6 @@ async def leaderboard(ctx, category: str = "level"):
 
 @bot.command()
 async def manual(ctx):
-    """📘 マニュアル"""
     embed = discord.Embed(title="📜 Botコマンド", color=discord.Color.blue())
     embed.add_field(name="🔰 一般用", value="`/link`, `/list`, `/leaderboard`", inline=False)
     if is_admin_or_owner(ctx):
@@ -544,7 +550,6 @@ async def manual(ctx):
 
 @bot.command()
 async def set_mode(ctx, mode: str):
-    """⚙️ モード変更"""
     if not is_admin_or_owner(ctx): return
     global current_mode
     mode = mode.upper()
