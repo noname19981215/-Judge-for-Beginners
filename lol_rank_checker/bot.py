@@ -33,11 +33,11 @@ current_guild_id = GUILD_ID
 ROLE_MEMBER = "Member"
 ROLE_WAITING = "waiting_review"
 ROLE_ADVISOR = "助言者"
-ROLE_GRACE = "卒業猶予"  # ★追加: レベル上限を無視できるロール
+ROLE_GRACE = "卒業猶予"  # レベル上限を無視できるロール
 
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
-MAX_LEVEL = 150
+MAX_LEVEL =150
 
 # モード設定
 current_mode = "BEGINNER"
@@ -56,14 +56,15 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-api_config = {"timeout": 5.0}
+# ★修正: タイムアウトを20秒に延長 (混雑時でも粘るように変更)
+api_config = {"timeout": 20.0}
 
 if not RIOT_API_KEY:
     lol_watcher = LolWatcher('dummy', **api_config)
     riot_watcher = RiotWatcher('dummy', **api_config)
 else:
-    lol_watcher = LolWatcher(RIOT_API_KEY, timeout=5.0)
-    riot_watcher = RiotWatcher(RIOT_API_KEY, timeout=5.0)
+    lol_watcher = LolWatcher(RIOT_API_KEY, timeout=20.0)
+    riot_watcher = RiotWatcher(RIOT_API_KEY, timeout=20.0)
 
 # ==========================================
 # MongoDB接続 (リトライ機能付き)
@@ -145,7 +146,7 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
         if discord_id_for_save:
             save_user_to_db(discord_id_for_save, riot_id_name, riot_id_tag, puuid, acct_level)
 
-        # ★修正: 助言者または卒業猶予ロールがあればレベルチェックをスキップ
+        # 助言者または卒業猶予ロールがあればレベルチェックをスキップ
         if not is_exempt and acct_level >= MAX_LEVEL:
             return {"status": "GRADUATE", "reason": f"レベル上限超過 (Lv{acct_level})",
                     "data": {"riot_id": f"{riot_id_name}#{riot_id_tag}", "level_raw": acct_level}}
@@ -333,12 +334,12 @@ async def run_audit_logic(ctx):
     graduates = []
 
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
-    role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)  # ★追加
+    role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)
 
     for i, u in enumerate(users):
         member = ctx.guild.get_member(u['discord_id'])
 
-        # ★修正: 助言者 または 卒業猶予ロールを持っているなら監査をスキップ
+        # 助言者 または 卒業猶予ロールを持っているなら監査をスキップ
         if member:
             if role_advisor and role_advisor in member.roles: continue
             if role_grace and role_grace in member.roles: continue
@@ -386,15 +387,15 @@ async def link(ctx, riot_id_str):
     if current_guild_id != 0 and ctx.guild.id != current_guild_id: return await ctx.send("⚠️ 対象外サーバー")
 
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
-    role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)  # ★追加
+    role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)
 
-    # ★修正: 助言者または卒業猶予なら免除
+    # 助言者または卒業猶予なら免除
     is_exempt = False
     if role_advisor and role_advisor in ctx.author.roles: is_exempt = True
     if role_grace and role_grace in ctx.author.roles: is_exempt = True
 
     name, tag = riot_id_str.split('#', 1)
-    # 免除フラグがある場合、メッセージに表示
+
     note = ""
     if is_exempt: note = "(免除対象)"
 
