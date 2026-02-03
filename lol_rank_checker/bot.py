@@ -125,7 +125,7 @@ def save_user_to_db(discord_id, riot_name, riot_tag, puuid, level, stats=None):
         print(f"⚠️ DB保存スキップ: {e}")
 
 
-# ★新機能: Riot API用リトライ関数
+# Riot API用リトライ関数
 def call_riot_api(func, *args, **kwargs):
     """API呼び出しを最大3回リトライする"""
     max_retries = 3
@@ -133,36 +133,38 @@ def call_riot_api(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            # 404(見つからない)や403(禁止)はリトライしても無駄なので即エラーにする
+            # 404や403はリトライしても無駄なので即raise
             if isinstance(e, ApiError):
                 if e.response.status_code in [404, 403]:
                     raise e
 
-            # それ以外の通信エラーならリトライ
+            # その他の通信エラーはリトライ
             print(f"⚠️ Riot API通信エラー (再試行 {i + 1}/{max_retries}): {e}")
             if i < max_retries - 1:
-                time.sleep(2)  # 2秒待ってから再挑戦
+                time.sleep(2)
             else:
-                raise e  # 3回ダメなら諦めてエラーを出す
+                raise e  # 3回ダメならエラーを投げる
 
 
 # ==========================================
-# 分析ロジック (エラー文完全日本語化)
+# 分析ロジック (★完全日本語化対応)
 # ==========================================
 async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=None, is_exempt=False):
     config = THRESHOLDS[current_mode]
     try:
         try:
-            # リトライ関数経由で呼び出す
             account = call_riot_api(riot_watcher.account.by_riot_id, REGION_ACCOUNT, riot_id_name, riot_id_tag)
         except ApiError as err:
             if err.response.status_code == 404:
                 return {"status": "ERROR",
-                        "reason": "❌ プレイヤーが見つかりません。\nIDとタグが正しいか確認してください。\n(例: Hide on bush#KR1)"}
+                        "reason": "❌ プレイヤーが見つかりません。\nIDとタグが正しいか確認してください (例: Name#JP1)。"}
+            elif err.response.status_code == 403:
+                return {"status": "ERROR",
+                        "reason": "❌ APIキーの有効期限が切れているか、無効です。管理者に連絡してください。"}
             raise
 
         puuid = account.get('puuid')
-        if not puuid: return {"status": "ERROR", "reason": "❌ プレイヤーID(PUUID)の取得に失敗しました。",
+        if not puuid: return {"status": "ERROR", "reason": "❌ プレイヤー情報の取得に失敗しました (PUUID不明)。",
                               "data": locals()}
 
         summoner = call_riot_api(lol_watcher.summoner.by_puuid, REGION_PLATFORM, puuid)
@@ -233,8 +235,7 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
             if team_total_dmg > 0 and (me['totalDamageDealtToChampions'] / team_total_dmg) * 100 < 5.0: troll_dmg += 1
 
         if valid == 0: return {"status": "REVIEW",
-                               "reason": "⚠️ 集計可能な試合データがありませんでした (試合時間が短い、またはデータ不足)。",
-                               "data": locals()}
+                               "reason": "⚠️ 集計可能なデータが不足しています (試合時間が短いなど)。", "data": locals()}
 
         win_rate = (wins / valid) * 100
         avg_kda = (kills + assists) / (deaths if deaths > 0 else 1)
@@ -276,7 +277,20 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
 
     except Exception as e:
         print(traceback.format_exc())
-        return {"status": "ERROR", "reason": f"予期せぬエラーが発生しました: {e}"}
+        # ★ここが変更点: エラー内容を判別して日本語メッセージに変換
+        err_msg = str(e)
+        jp_error = ""
+
+        if "Connection aborted" in err_msg or "Connection reset" in err_msg:
+            jp_error = "❌ サーバーとの通信が切断されました。混雑している可能性があります。もう一度試してください。"
+        elif "timeout" in err_msg.lower():
+            jp_error = "❌ 通信がタイムアウトしました。応答が遅いため、しばらく待ってから再試行してください。"
+        elif "500" in err_msg or "503" in err_msg:
+            jp_error = "❌ Riotのサーバーがダウンしているか、メンテナンス中です。"
+        else:
+            jp_error = f"❌ 予期せぬエラーが発生しました。\n(詳細: {err_msg})"
+
+        return {"status": "ERROR", "reason": jp_error}
 
 
 # ==========================================
@@ -433,6 +447,7 @@ async def link(ctx, riot_id_str):
     result = await analyze_player_stats(name, tag, ctx.author.id, is_exempt=is_exempt)
     status = result['status']
 
+    # ★日本語化されたエラーメッセージを表示
     if status == "ERROR": return await ctx.send(f"{result['reason']}")
 
     member = ctx.author
