@@ -57,7 +57,6 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-# タイムアウトを20秒に設定
 api_config = {"timeout": 20.0}
 
 if not RIOT_API_KEY:
@@ -125,25 +124,21 @@ def save_user_to_db(discord_id, riot_name, riot_tag, puuid, level, stats=None):
         print(f"⚠️ DB保存スキップ: {e}")
 
 
-# Riot API用リトライ関数 (HTMLログ対策済み)
+# Riot API用リトライ関数
 def call_riot_api(func, *args, **kwargs):
     max_retries = 3
     for i in range(max_retries):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            # 404/403は即時終了
             if isinstance(e, ApiError):
                 if e.response.status_code in [404, 403]:
                     raise e
-
-            # エラー文が長いHTML(Cloudflare)の場合は省略して表示
             err_str = str(e)
             if "<html" in err_str or "Cloudflare" in err_str:
                 print(f"⚠️ Cloudflare/Server Error (再試行 {i + 1}/{max_retries})")
             else:
                 print(f"⚠️ 通信エラー (再試行 {i + 1}/{max_retries}): {e}")
-
             if i < max_retries - 1:
                 time.sleep(2)
             else:
@@ -275,7 +270,6 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
         return {"status": "REVIEW", "reason": "完了", "data": data_snapshot}
 
     except Exception as e:
-        # ログには詳細を出すがHTMLなら省略
         err_str = str(e)
         if "<html" in err_str:
             print("❌ Cloudflare HTML Error detected in logs.")
@@ -284,17 +278,17 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
 
         jp_error = "❌ 予期せぬエラー"
         if "Connection" in err_str or "timeout" in err_str.lower():
-            jp_error = "❌ サーバー混雑のため通信エラーが発生しました。時間を置いて再試行してください。"
-        elif "500" in err_str or "502" in err_str or "503" in err_str or "504" in err_str:
-            jp_error = "❌ Riot APIサーバーがダウンしています(5xx Error)。復旧までお待ちください。"
+            jp_error = "❌ サーバー混雑のため通信エラーが発生しました。"
+        elif "500" in err_str or "502" in err_str or "503" in err_str:
+            jp_error = "❌ Riot APIサーバーがダウンしています。"
         else:
-            jp_error = "❌ エラーが発生しました。ログを確認してください。"
+            jp_error = "❌ エラーが発生しました。"
 
         return {"status": "ERROR", "reason": jp_error}
 
 
 # ==========================================
-# ダッシュボードUI
+# UI & コマンド
 # ==========================================
 class DashboardView(View):
     def __init__(self, ctx):
@@ -353,13 +347,11 @@ async def update_dashboard(interaction_or_ctx, ctx_origin):
     admin_name = admin_user.name if admin_user else "未設定"
     member_count = users_col.count_documents({}) if users_col else 0
     mode_info = THRESHOLDS[current_mode]
-
     embed = discord.Embed(title="🎛️ 管理ダッシュボード", color=discord.Color.dark_theme())
     embed.add_field(name="🏠 サーバー", value=f"{ctx_origin.guild.name}", inline=True)
     embed.add_field(name="👤 管理者", value=f"{admin_name}", inline=True)
     embed.add_field(name="👥 メンバー数", value=f"{member_count} 名", inline=True)
     embed.add_field(name="📊 モード", value=f"**{mode_info['name']}**", inline=False)
-
     view = DashboardView(ctx_origin)
     if isinstance(interaction_or_ctx, commands.Context):
         await interaction_or_ctx.send(embed=embed, view=view)
@@ -373,16 +365,13 @@ async def run_audit_logic(ctx):
     users = list(users_col.find())
     total = len(users)
     graduates = []
-
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
     role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)
-
     for i, u in enumerate(users):
         member = ctx.guild.get_member(u['discord_id'])
         if member:
             if role_advisor and role_advisor in member.roles: continue
             if role_grace and role_grace in member.roles: continue
-
         await asyncio.sleep(3.0)
         try:
             summ = call_riot_api(lol_watcher.summoner.by_puuid, REGION_PLATFORM, u['puuid'])
@@ -392,24 +381,18 @@ async def run_audit_logic(ctx):
                 graduates.append(f"<@{u['discord_id']}> (Lv.{new_level})")
         except:
             pass
-
         if i % 5 == 0: await status_msg.edit(content=f"🔍 監査中... {int((i / total) * 100)}%")
-
     await status_msg.edit(content="✅ 監査完了")
     if graduates: await ctx.send(f"⚠️ **卒業対象:**\n" + "\n".join(graduates))
 
 
-# ==========================================
-# コマンド
-# ==========================================
 @bot.event
 async def on_ready():
     print(f'Bot is ready: {bot.user.name}')
     if LOG_CHANNEL_ID:
         try:
             channel = bot.get_channel(LOG_CHANNEL_ID)
-            if channel:
-                await channel.send("✅ **BOTが起動しました**")
+            if channel: await channel.send("✅ **BOTが起動しました**")
         except:
             pass
 
@@ -422,13 +405,12 @@ async def dashboard(ctx):
 
 @bot.command()
 async def standards(ctx):
-    """現在のランク基準を表示"""
     mode = THRESHOLDS[current_mode]
     embed = discord.Embed(title=f"📏 現在の基準: {mode['name']}", color=discord.Color.blue())
-    embed.add_field(name="勝率 (Win Rate)", value=f"**{mode['win_rate']}%** 以上で警告", inline=True)
+    embed.add_field(name="勝率", value=f"**{mode['win_rate']}%** 以上で警告", inline=True)
     embed.add_field(name="KDA", value=f"**{mode['kda']}** 以上で警告", inline=True)
-    embed.add_field(name="CS/分 (CSPM)", value=f"**{mode['cspm']}** 以上で警告", inline=True)
-    embed.add_field(name="Gold/分 (GPM)", value=f"**{mode['gpm']}** 以上で警告", inline=True)
+    embed.add_field(name="CS/分", value=f"**{mode['cspm']}** 以上で警告", inline=True)
+    embed.add_field(name="Gold/分", value=f"**{mode['gpm']}** 以上で警告", inline=True)
     embed.add_field(name="DMGシェア", value=f"**{mode['dmg']}%** 以上で警告", inline=True)
     embed.add_field(name="レベル上限", value=f"**Lv.{MAX_LEVEL}** (これ以上は卒業)", inline=False)
     await ctx.send(embed=embed)
@@ -438,25 +420,18 @@ async def standards(ctx):
 async def link(ctx, riot_id_str):
     if '#' not in riot_id_str: return await ctx.send("❌ `名前#タグ` の形式で入力してください (例: Name#JP1)")
     if current_guild_id != 0 and ctx.guild.id != current_guild_id: return await ctx.send("⚠️ 対象外サーバー")
-
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
     role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)
     is_exempt = False
     if role_advisor and role_advisor in ctx.author.roles: is_exempt = True
     if role_grace and role_grace in ctx.author.roles: is_exempt = True
-
     name, tag = riot_id_str.split('#', 1)
     note = "(免除対象)" if is_exempt else ""
-
     await ctx.send(f"📊 `{name}#{tag}` を分析中... {note}")
-
     result = await analyze_player_stats(name, tag, ctx.author.id, is_exempt=is_exempt)
     status = result['status']
-
     if status == "ERROR": return await ctx.send(f"{result['reason']}")
-
     member = ctx.author
-
     if status == "GRADUATE":
         await ctx.send("🎓 レベル上限超過のため卒業対象です。")
         try:
@@ -468,10 +443,8 @@ async def link(ctx, riot_id_str):
         except:
             pass
         return
-
     role_waiting = discord.utils.get(ctx.guild.roles, name=ROLE_WAITING)
     if role_waiting: await member.add_roles(role_waiting)
-
     await ctx.send("📋 集計完了。承認をお待ちください。")
     try:
         admin = await bot.fetch_user(current_admin_id)
@@ -479,7 +452,6 @@ async def link(ctx, riot_id_str):
             d = result['data']
             opgg = f"https://www.op.gg/summoners/jp/{name}-{tag}"
             mode_name = THRESHOLDS[current_mode]['name']
-
             msg = (f"**【新規申請 / {mode_name}】**\n"
                    f"対象: {member.mention}\n"
                    f"ID: `{d['riot_id']}`\n"
@@ -487,7 +459,6 @@ async def link(ctx, riot_id_str):
                    f"CS:{d['fmt_cspm']} GPM: {d['fmt_gpm']} Dmg:{d['fmt_dmg']}\n"
                    f"警告: {d['troll']} [OP.GG]({opgg})\n"
                    f"`/approve {member.id}` / `/reject {member.id}`")
-
             await admin.send(msg)
     except:
         pass
@@ -545,12 +516,6 @@ async def graduate_rank(ctx, user_id: int):
 @bot.command()
 async def shutdown(ctx):
     if not is_admin_or_owner(ctx): return
-    if LOG_CHANNEL_ID:
-        try:
-            channel = bot.get_channel(LOG_CHANNEL_ID)
-            if channel: await channel.send("🛑 **BOT終了**")
-        except:
-            pass
     await ctx.send("システムをシャットダウンします...")
     await bot.close()
 
@@ -611,5 +576,23 @@ async def set_mode(ctx, mode: str):
 
 
 keep_alive()
+
+# ==========================================
+# ★ここが最終防衛ライン★
+# Discordに接続できなくても、クラッシュさせずに待機する
+# ==========================================
 if DISCORD_TOKEN:
-    bot.run(DISCORD_TOKEN)
+    while True:
+        try:
+            bot.run(DISCORD_TOKEN)
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "1015" in err_str or "<html" in err_str:
+                print("🚨 Discord APIレート制限(429)が発生しました。")
+                print("⚠️ 30分間待機してから再接続します... (今はそっとしておいてください)")
+                # CloudflareのBANは解除まで時間がかかるため、長めに待機してループを防ぐ
+                time.sleep(1800)
+            else:
+                print(f"⚠️ 接続エラー: {e}")
+                print("⚠️ 30秒後に再接続します...")
+                time.sleep(30)
