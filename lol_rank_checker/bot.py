@@ -579,19 +579,30 @@ async def set_mode(ctx, mode: str):
 
 
 # ==========================================
-# 起動処理 (BAN対策: ループさせずに待機終了)
+# 起動処理 (デバッグ・診断モード)
 # ==========================================
+print("★ システム起動プロセスを開始します ★")  # これが出なければRenderが壊れています
 keep_alive()
 
+print(f"★ 環境変数の確認: DISCORD_TOKEN = {'あり' if DISCORD_TOKEN else 'なし (⚠️ここが原因かも)'}")
+
 if DISCORD_TOKEN:
+    print("★ Tokenを確認しました。Discordへの接続を試みます...")
     try:
         bot.run(DISCORD_TOKEN)
     except Exception as e:
         err_str = str(e)
+        print(f"❌ 接続中にエラーが発生しました: {err_str}")
+
         if "429" in err_str or "1015" in err_str or "<html" in err_str:
-            print("🚨 Discord APIにより一時的に遮断されています (Rate Limit)。")
-            print("⏳ 60分間待機してから終了します。Renderが再起動するまでお待ちください...")
-            time.sleep(3600)  # 1時間待つ
-            print("🔄 待機終了。")
+            print("🚨 診断結果: Discord APIによるBAN（レート制限）がまだ続いています。")
+            print("⏳ 解決策: Renderを停止して、あと数時間待つしかありません。")
+            # ループさせずに終了させる（ログを残すため）
         else:
-            print(f"❌ 致命的なエラー: {e}")
+            print("🚨 診断結果: 予期せぬエラーです。上記のエラー文を確認してください。")
+else:
+    # ここが実行されたら、Renderの設定ミスです
+    print("❌ 【致命的エラー】DISCORD_TOKEN が設定されていません！")
+    print("👉 Renderの [Environment] タブを開き、DISCORD_TOKEN を追加してください。")
+
+print("★ プログラムを終了します ★")
