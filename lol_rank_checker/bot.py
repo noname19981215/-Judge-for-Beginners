@@ -38,7 +38,7 @@ ROLE_GRACE = "卒業猶予"
 
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
-MAX_LEVEL = 150
+MAX_LEVEL = 500
 
 # モード設定
 current_mode = "BEGINNER"
@@ -57,6 +57,7 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
+# APIタイムアウト設定 (20秒)
 api_config = {"timeout": 20.0}
 
 if not RIOT_API_KEY:
@@ -124,7 +125,7 @@ def save_user_to_db(discord_id, riot_name, riot_tag, puuid, level, stats=None):
         print(f"⚠️ DB保存スキップ: {e}")
 
 
-# Riot API用リトライ関数
+# Riot API用リトライ関数 (HTMLログ対策済み)
 def call_riot_api(func, *args, **kwargs):
     max_retries = 3
     for i in range(max_retries):
@@ -134,11 +135,14 @@ def call_riot_api(func, *args, **kwargs):
             if isinstance(e, ApiError):
                 if e.response.status_code in [404, 403]:
                     raise e
+
+            # Cloudflare等のHTMLエラーはログを短縮
             err_str = str(e)
             if "<html" in err_str or "Cloudflare" in err_str:
                 print(f"⚠️ Cloudflare/Server Error (再試行 {i + 1}/{max_retries})")
             else:
                 print(f"⚠️ 通信エラー (再試行 {i + 1}/{max_retries}): {e}")
+
             if i < max_retries - 1:
                 time.sleep(2)
             else:
@@ -146,7 +150,7 @@ def call_riot_api(func, *args, **kwargs):
 
 
 # ==========================================
-# 分析ロジック
+# 分析ロジック (日本語エラーメッセージ)
 # ==========================================
 async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=None, is_exempt=False):
     config = THRESHOLDS[current_mode]
@@ -575,24 +579,20 @@ async def set_mode(ctx, mode: str):
         await ctx.send(f"✅ モード変更: {THRESHOLDS[mode]['name']}")
 
 
+# ==========================================
+# 起動処理 (BAN対策: ループさせずに待機終了)
+# ==========================================
 keep_alive()
 
-# ==========================================
-# ★ここが最終防衛ライン★
-# Discordに接続できなくても、クラッシュさせずに待機する
-# ==========================================
 if DISCORD_TOKEN:
-    while True:
-        try:
-            bot.run(DISCORD_TOKEN)
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "1015" in err_str or "<html" in err_str:
-                print("🚨 Discord APIレート制限(429)が発生しました。")
-                print("⚠️ 30分間待機してから再接続します... (今はそっとしておいてください)")
-                # CloudflareのBANは解除まで時間がかかるため、長めに待機してループを防ぐ
-                time.sleep(1800)
-            else:
-                print(f"⚠️ 接続エラー: {e}")
-                print("⚠️ 30秒後に再接続します...")
-                time.sleep(30)
+    try:
+        bot.run(DISCORD_TOKEN)
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "1015" in err_str or "<html" in err_str:
+            print("🚨 Discord APIにより一時的に遮断されています (Rate Limit)。")
+            print("⏳ 60分間待機してから終了します。Renderが再起動するまでお待ちください...")
+            time.sleep(3600)  # 1時間待つ
+            print("🔄 待機終了。")
+        else:
+            print(f"❌ 致命的なエラー: {e}")
