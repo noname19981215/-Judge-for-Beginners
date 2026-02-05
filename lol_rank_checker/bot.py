@@ -57,7 +57,6 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-# APIタイムアウト設定 (20秒)
 api_config = {"timeout": 20.0}
 
 if not RIOT_API_KEY:
