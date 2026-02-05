@@ -38,7 +38,7 @@ ROLE_GRACE = "卒業猶予"
 
 REGION_PLATFORM = 'jp1'
 REGION_ACCOUNT = 'asia'
-MAX_LEVEL = 500
+MAX_LEVEL = 150
 
 # モード設定
 current_mode = "BEGINNER"
@@ -135,7 +135,6 @@ def call_riot_api(func, *args, **kwargs):
                 if e.response.status_code in [404, 403]:
                     raise e
 
-            # Cloudflare等のHTMLエラーはログを短縮
             err_str = str(e)
             if "<html" in err_str or "Cloudflare" in err_str:
                 print(f"⚠️ Cloudflare/Server Error (再試行 {i + 1}/{max_retries})")
@@ -149,7 +148,7 @@ def call_riot_api(func, *args, **kwargs):
 
 
 # ==========================================
-# 分析ロジック (日本語エラーメッセージ)
+# 分析ロジック
 # ==========================================
 async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=None, is_exempt=False):
     config = THRESHOLDS[current_mode]
@@ -395,7 +394,7 @@ async def on_ready():
     if LOG_CHANNEL_ID:
         try:
             channel = bot.get_channel(LOG_CHANNEL_ID)
-            if channel: await channel.send("✅ **BOTが起動しました**")
+            if channel: await channel.send("✅ **BOTが起動しました** (再デプロイ/復旧完了)")
         except:
             pass
 
@@ -420,15 +419,21 @@ async def standards(ctx):
 
 
 @bot.command()
-async def link(ctx, riot_id_str):
+async def link(ctx, *, riot_id_str):  # ←ここが修正箇所（スペース対応）
     if '#' not in riot_id_str: return await ctx.send("❌ `名前#タグ` の形式で入力してください (例: Name#JP1)")
     if current_guild_id != 0 and ctx.guild.id != current_guild_id: return await ctx.send("⚠️ 対象外サーバー")
+
+    # 全角スペースを半角に
+    riot_id_str = riot_id_str.replace("　", " ")
+
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
     role_grace = discord.utils.get(ctx.guild.roles, name=ROLE_GRACE)
     is_exempt = False
     if role_advisor and role_advisor in ctx.author.roles: is_exempt = True
     if role_grace and role_grace in ctx.author.roles: is_exempt = True
-    name, tag = riot_id_str.split('#', 1)
+
+    # 最後の#で分割
+    name, tag = riot_id_str.rsplit('#', 1)
     note = "(免除対象)" if is_exempt else ""
     await ctx.send(f"📊 `{name}#{tag}` を分析中... {note}")
     result = await analyze_player_stats(name, tag, ctx.author.id, is_exempt=is_exempt)
@@ -453,7 +458,8 @@ async def link(ctx, riot_id_str):
         admin = await bot.fetch_user(current_admin_id)
         if admin:
             d = result['data']
-            opgg = f"https://www.op.gg/summoners/jp/{name}-{tag}"
+            # スペースをURLエンコード
+            opgg = f"https://www.op.gg/summoners/jp/{name.replace(' ', '%20')}-{tag}"
             mode_name = THRESHOLDS[current_mode]['name']
             msg = (f"**【新規申請 / {mode_name}】**\n"
                    f"対象: {member.mention}\n"
@@ -579,30 +585,18 @@ async def set_mode(ctx, mode: str):
 
 
 # ==========================================
-# 起動処理 (デバッグ・診断モード)
+# 起動処理 (エラー時待機機能付き)
 # ==========================================
-print("★ システム起動プロセスを開始します ★")  # これが出なければRenderが壊れています
 keep_alive()
 
-print(f"★ 環境変数の確認: DISCORD_TOKEN = {'あり' if DISCORD_TOKEN else 'なし (⚠️ここが原因かも)'}")
-
 if DISCORD_TOKEN:
-    print("★ Tokenを確認しました。Discordへの接続を試みます...")
     try:
         bot.run(DISCORD_TOKEN)
     except Exception as e:
         err_str = str(e)
-        print(f"❌ 接続中にエラーが発生しました: {err_str}")
-
         if "429" in err_str or "1015" in err_str or "<html" in err_str:
-            print("🚨 診断結果: Discord APIによるBAN（レート制限）がまだ続いています。")
-            print("⏳ 解決策: Renderを停止して、あと数時間待つしかありません。")
-            # ループさせずに終了させる（ログを残すため）
+            print("🚨 Discord APIにより一時的に遮断されています (Rate Limit)。")
+            print("⏳ 60分間待機してから終了します。")
+            time.sleep(3600)
         else:
-            print("🚨 診断結果: 予期せぬエラーです。上記のエラー文を確認してください。")
-else:
-    # ここが実行されたら、Renderの設定ミスです
-    print("❌ 【致命的エラー】DISCORD_TOKEN が設定されていません！")
-    print("👉 Renderの [Environment] タブを開き、DISCORD_TOKEN を追加してください。")
-
-print("★ プログラムを終了します ★")
+            print(f"❌ 致命的なエラー: {e}")
