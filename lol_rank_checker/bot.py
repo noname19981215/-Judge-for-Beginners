@@ -119,13 +119,14 @@ def save_user_to_db(discord_id, riot_name, riot_tag, puuid, level, stats=None):
             "last_updated": now
         }
         if stats: update_data.update(stats)
-        users_col.with_options(timeout=3).update_one({"discord_id": discord_id}, {"$set": update_data}, upsert=True)
+        # timeoutオプションを削除して安定性向上
+        users_col.update_one({"discord_id": discord_id}, {"$set": update_data}, upsert=True)
         print(f"💾 DB保存完了: {riot_name}#{riot_tag}")
     except Exception as e:
         print(f"⚠️ DB保存スキップ: {e}")
 
 
-# Riot API用リトライ関数 (HTMLログ対策済み)
+# Riot API用リトライ関数
 def call_riot_api(func, *args, **kwargs):
     max_retries = 3
     for i in range(max_retries):
@@ -133,6 +134,7 @@ def call_riot_api(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             if isinstance(e, ApiError):
+                # 500番台のエラーはRiot側の問題なのでリトライ対象
                 if e.response.status_code in [404, 403]:
                     raise e
 
@@ -149,10 +151,12 @@ def call_riot_api(func, *args, **kwargs):
 
 
 # ==========================================
-# 分析ロジック
+# 分析ロジック (KeyError修正版)
 # ==========================================
 async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=None, is_exempt=False):
     config = THRESHOLDS[current_mode]
+    riot_id_combined = f"{riot_id_name}#{riot_id_tag}"  # 先に定義しておく
+
     try:
         try:
             account = call_riot_api(riot_watcher.account.by_riot_id, REGION_ACCOUNT, riot_id_name, riot_id_tag)
@@ -174,7 +178,7 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
 
         if not is_exempt and acct_level >= MAX_LEVEL:
             return {"status": "GRADUATE", "reason": f"🎓 レベル上限超過 (Lv.{acct_level})",
-                    "data": {"riot_id": f"{riot_id_name}#{riot_id_tag}", "level_raw": acct_level}}
+                    "data": {"riot_id": riot_id_combined, "level_raw": acct_level}}
 
         matches = call_riot_api(lol_watcher.match.matchlist_by_puuid, REGION_ACCOUNT, puuid, count=20)
         if not matches:
@@ -233,7 +237,19 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
             if item_cnt <= 1 and duration_min > 10: troll_items += 1
             if team_total_dmg > 0 and (me['totalDamageDealtToChampions'] / team_total_dmg) * 100 < 5.0: troll_dmg += 1
 
-        if valid == 0: return {"status": "REVIEW", "reason": "⚠️ 集計可能なデータ不足", "data": locals()}
+        # データ不足時のクラッシュ対策
+        if valid == 0:
+            # データ不足時でも必要な情報をダミーで埋めて返す
+            safe_data = {
+                "riot_id": riot_id_combined,
+                "level_raw": acct_level,
+                "fmt_level": f"{acct_level}",
+                "fmt_win": "不明", "fmt_kda": "不明",
+                "fmt_cspm": "不明", "fmt_gpm": "不明", "fmt_dmg": "不明",
+                "troll": "不明(APIエラー)",
+                "matches": 0
+            }
+            return {"status": "REVIEW", "reason": "⚠️ Riotサーバー不調のため詳細データ取得不能", "data": safe_data}
 
         win_rate = (wins / valid) * 100
         avg_kda = (kills + assists) / (deaths if deaths > 0 else 1)
@@ -259,7 +275,7 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
         if (valid - wins) > 0 and (troll_ff / (valid - wins)) >= 0.5: trolls.append(f"💀EarlyFF")
 
         data_snapshot = {
-            "riot_id": f"{riot_id_name}#{riot_id_tag}",
+            "riot_id": riot_id_combined,
             "level_raw": acct_level,
             "fmt_level": fmt(acct_level, 50, "", True),
             "fmt_win": fmt(win_rate, config["win_rate"], "%"),
@@ -280,10 +296,8 @@ async def analyze_player_stats(riot_id_name, riot_id_tag, discord_id_for_save=No
             print(traceback.format_exc())
 
         jp_error = "❌ 予期せぬエラー"
-        if "Connection" in err_str or "timeout" in err_str.lower():
-            jp_error = "❌ サーバー混雑のため通信エラーが発生しました。"
-        elif "500" in err_str or "502" in err_str or "503" in err_str:
-            jp_error = "❌ Riot APIサーバーがダウンしています。"
+        if "Connection" in err_str or "timeout" in err_str.lower() or "500" in err_str:
+            jp_error = "❌ Riotサーバーが不安定です（APIエラー）。"
         else:
             jp_error = "❌ エラーが発生しました。"
 
@@ -379,7 +393,8 @@ async def run_audit_logic(ctx):
         try:
             summ = call_riot_api(lol_watcher.summoner.by_puuid, REGION_PLATFORM, u['puuid'])
             new_level = summ['summonerLevel']
-            users_col.with_options(timeout=3).update_one({"_id": u['_id']}, {"$set": {"level": new_level}})
+            # timeoutオプションを削除
+            users_col.update_one({"_id": u['_id']}, {"$set": {"level": new_level}})
             if new_level >= MAX_LEVEL:
                 graduates.append(f"<@{u['discord_id']}> (Lv.{new_level})")
         except:
@@ -395,7 +410,7 @@ async def on_ready():
     if LOG_CHANNEL_ID:
         try:
             channel = bot.get_channel(LOG_CHANNEL_ID)
-            if channel: await channel.send("✅ **BOTが起動しました** (再デプロイ/復旧完了)")
+            if channel: await channel.send("✅ **BOTが起動しました** (Riot障害対策済み)")
         except:
             pass
 
@@ -424,7 +439,6 @@ async def link(ctx, *, riot_id_str):
     if '#' not in riot_id_str: return await ctx.send("❌ `名前#タグ` の形式で入力してください (例: Name#JP1)")
     if current_guild_id != 0 and ctx.guild.id != current_guild_id: return await ctx.send("⚠️ 対象外サーバー")
 
-    # 全角スペースを半角に
     riot_id_str = riot_id_str.replace("　", " ")
 
     role_advisor = discord.utils.get(ctx.guild.roles, name=ROLE_ADVISOR)
@@ -433,7 +447,6 @@ async def link(ctx, *, riot_id_str):
     if role_advisor and role_advisor in ctx.author.roles: is_exempt = True
     if role_grace and role_grace in ctx.author.roles: is_exempt = True
 
-    # 最後の#で分割
     name, tag = riot_id_str.rsplit('#', 1)
     note = "(免除対象)" if is_exempt else ""
     await ctx.send(f"📊 `{name}#{tag}` を分析中... {note}")
@@ -455,46 +468,35 @@ async def link(ctx, *, riot_id_str):
     role_waiting = discord.utils.get(ctx.guild.roles, name=ROLE_WAITING)
     if role_waiting: await member.add_roles(role_waiting)
 
-    # === デバッグ用：DM送信処理 (詳細ログ版) ===
     await ctx.send("📋 集計完了。承認をお待ちください。")
-    print(f"🔍 [DEBUG] 管理者ID(環境変数): {current_admin_id}")
 
+    # DM送信（デバッグログ付き）
+    print(f"🔍 [DEBUG] 管理者ID(環境変数): {current_admin_id}")
     try:
         if current_admin_id == 0:
-            print("❌ [ERROR] 管理者IDが '0' または未設定です。Renderの環境変数 ADMIN_USER_ID を確認してください！")
-            await ctx.send(f"⚠️ エラー: 管理者IDが設定されていません (ID: {current_admin_id})")
+            print("❌ [ERROR] 管理者ID未設定")
             return
 
         admin = await bot.fetch_user(current_admin_id)
-        print(f"✅ [DEBUG] 管理者ユーザーを発見: {admin.name} (ID: {admin.id})")
 
         d = result['data']
-        # スペースをURLエンコード
+        # Riotエラー時はデータが存在しない可能性があるので .get() を使う
         opgg = f"https://www.op.gg/summoners/jp/{name.replace(' ', '%20')}-{tag}"
         mode_name = THRESHOLDS[current_mode]['name']
 
         msg = (f"**【新規申請 / {mode_name}】**\n"
                f"対象: {member.mention}\n"
-               f"ID: `{d['riot_id']}`\n"
-               f"Lv: {d['fmt_level']} Win:{d['fmt_win']} KDA:{d['fmt_kda']}\n"
-               f"CS:{d['fmt_cspm']} GPM: {d['fmt_gpm']} Dmg:{d['fmt_dmg']}\n"
-               f"警告: {d['troll']} [OP.GG]({opgg})\n"
+               f"ID: `{d.get('riot_id', '取得不能')}`\n"
+               f"Lv: {d.get('fmt_level', '不明')} Win:{d.get('fmt_win', '不明')} KDA:{d.get('fmt_kda', '不明')}\n"
+               f"CS:{d.get('fmt_cspm', '不明')} GPM: {d.get('fmt_gpm', '不明')} Dmg:{d.get('fmt_dmg', '不明')}\n"
+               f"警告: {d.get('troll', '不明')} [OP.GG]({opgg})\n"
                f"`/approve {member.id}` / `/reject {member.id}`")
 
         await admin.send(msg)
         print("📨 [SUCCESS] DM送信に成功しました！")
 
-    except discord.Forbidden:
-        print("❌ [ERROR] DM送信失敗 (403): Botが管理者にDMを送る権限がありません。")
-        await ctx.send("⚠️ 管理者へのDM送信に失敗しました（プライバシー設定でDMを拒否している可能性があります）。")
-    except discord.HTTPException as e:
-        print(f"❌ [ERROR] DM送信失敗 (HTTP Error): {e}")
-        if "429" in str(e):
-            print(
-                "🚨 [RATE LIMIT] 短時間にDMを送りすぎたため、Discordに一時的にブロックされています。時間を置いてください。")
-        await ctx.send(f"⚠️ 管理者への通知エラー: {e}")
     except Exception as e:
-        print(f"❌ [ERROR] 予期せぬエラー: {e}")
+        print(f"❌ [ERROR] DM送信エラー: {e}")
         traceback.print_exc()
 
 
