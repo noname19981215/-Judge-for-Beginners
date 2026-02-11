@@ -24,6 +24,7 @@ MONGO_URL = os.getenv('MONGO_URL')
 # 通知を送るチャンネルID
 LOG_CHANNEL_ID = 1464619103468916829
 
+# 管理者IDとサーバーID (取得失敗時は 0 になる)
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
 GUILD_ID = int(os.getenv('GUILD_ID', 0))
 
@@ -419,7 +420,7 @@ async def standards(ctx):
 
 
 @bot.command()
-async def link(ctx, *, riot_id_str):  # ←ここが修正箇所（スペース対応）
+async def link(ctx, *, riot_id_str):
     if '#' not in riot_id_str: return await ctx.send("❌ `名前#タグ` の形式で入力してください (例: Name#JP1)")
     if current_guild_id != 0 and ctx.guild.id != current_guild_id: return await ctx.send("⚠️ 対象外サーバー")
 
@@ -453,24 +454,48 @@ async def link(ctx, *, riot_id_str):  # ←ここが修正箇所（スペース�
         return
     role_waiting = discord.utils.get(ctx.guild.roles, name=ROLE_WAITING)
     if role_waiting: await member.add_roles(role_waiting)
+
+    # === デバッグ用：DM送信処理 (詳細ログ版) ===
     await ctx.send("📋 集計完了。承認をお待ちください。")
+    print(f"🔍 [DEBUG] 管理者ID(環境変数): {current_admin_id}")
+
     try:
+        if current_admin_id == 0:
+            print("❌ [ERROR] 管理者IDが '0' または未設定です。Renderの環境変数 ADMIN_USER_ID を確認してください！")
+            await ctx.send(f"⚠️ エラー: 管理者IDが設定されていません (ID: {current_admin_id})")
+            return
+
         admin = await bot.fetch_user(current_admin_id)
-        if admin:
-            d = result['data']
-            # スペースをURLエンコード
-            opgg = f"https://www.op.gg/summoners/jp/{name.replace(' ', '%20')}-{tag}"
-            mode_name = THRESHOLDS[current_mode]['name']
-            msg = (f"**【新規申請 / {mode_name}】**\n"
-                   f"対象: {member.mention}\n"
-                   f"ID: `{d['riot_id']}`\n"
-                   f"Lv: {d['fmt_level']} Win:{d['fmt_win']} KDA:{d['fmt_kda']}\n"
-                   f"CS:{d['fmt_cspm']} GPM: {d['fmt_gpm']} Dmg:{d['fmt_dmg']}\n"
-                   f"警告: {d['troll']} [OP.GG]({opgg})\n"
-                   f"`/approve {member.id}` / `/reject {member.id}`")
-            await admin.send(msg)
-    except:
-        pass
+        print(f"✅ [DEBUG] 管理者ユーザーを発見: {admin.name} (ID: {admin.id})")
+
+        d = result['data']
+        # スペースをURLエンコード
+        opgg = f"https://www.op.gg/summoners/jp/{name.replace(' ', '%20')}-{tag}"
+        mode_name = THRESHOLDS[current_mode]['name']
+
+        msg = (f"**【新規申請 / {mode_name}】**\n"
+               f"対象: {member.mention}\n"
+               f"ID: `{d['riot_id']}`\n"
+               f"Lv: {d['fmt_level']} Win:{d['fmt_win']} KDA:{d['fmt_kda']}\n"
+               f"CS:{d['fmt_cspm']} GPM: {d['fmt_gpm']} Dmg:{d['fmt_dmg']}\n"
+               f"警告: {d['troll']} [OP.GG]({opgg})\n"
+               f"`/approve {member.id}` / `/reject {member.id}`")
+
+        await admin.send(msg)
+        print("📨 [SUCCESS] DM送信に成功しました！")
+
+    except discord.Forbidden:
+        print("❌ [ERROR] DM送信失敗 (403): Botが管理者にDMを送る権限がありません。")
+        await ctx.send("⚠️ 管理者へのDM送信に失敗しました（プライバシー設定でDMを拒否している可能性があります）。")
+    except discord.HTTPException as e:
+        print(f"❌ [ERROR] DM送信失敗 (HTTP Error): {e}")
+        if "429" in str(e):
+            print(
+                "🚨 [RATE LIMIT] 短時間にDMを送りすぎたため、Discordに一時的にブロックされています。時間を置いてください。")
+        await ctx.send(f"⚠️ 管理者への通知エラー: {e}")
+    except Exception as e:
+        print(f"❌ [ERROR] 予期せぬエラー: {e}")
+        traceback.print_exc()
 
 
 @bot.command()
